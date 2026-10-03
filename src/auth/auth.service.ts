@@ -109,4 +109,29 @@ export class AuthService {
             createdAt: user.createdAt,
         };
     }
+
+    async refresh(refreshToken: string) {
+        const session = await
+            this.refreshSessionsService.rotate(refreshToken);
+
+        const accessToken = await this.jwtService.signAsync({
+            sub: session.userId,
+        });
+
+        return {
+            accessToken,
+            refreshToken: session.refreshToken,
+            refreshTokenExpiresAt: session.expiresAt,
+            tokenType: 'Bearer',
+            expiresIn: 900,
+        };
+    }
+
+    async logout(refreshToken: string): Promise<void> {
+        await this.refreshSessionsService.revoke(refreshToken);
+    }
+
+    async logoutAll(userId: string): Promise<void> {
+        await this.refreshSessionsService.revokeAllForUser(userId);
+    }
 }

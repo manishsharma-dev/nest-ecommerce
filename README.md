@@ -1,24 +1,30 @@
 # Nest Ecommerce Backend
 
-An ecommerce backend built with NestJS, TypeScript, PostgreSQL, and TypeORM.
+An ecommerce backend built with NestJS, TypeScript, PostgreSQL, and TypeORM. Intended clients are Angular and Ionic browser/native applications.
 
-## Current Features
+## Implemented Features
 
-- User registration with request validation and Argon2id password hashing.
-- Login with JWT access tokens that expire after 15 minutes.
+- User registration with input validation and Argon2id password hashing.
+- Login with JWT access tokens and random refresh tokens.
 - Protected user profile endpoint.
-- Refresh-token generation with hashed sessions stored in PostgreSQL.
+- Refresh-token rotation with database transactions and row locking.
+- Single-session logout that revokes rotated tokens within the same session family.
+- Logout from all devices.
+- Swagger/OpenAPI documentation.
 
-Refresh-token rotation, logout, and browser cookie handling are still in progress.
+Browser cookie authentication and frontend integration are not yet complete.
 
 ## Requirements
 
-- Node.js 26.3.0 and npm 11.16.0 were used during development.
-- PostgreSQL running locally on port 5432.
+Development versions:
+
+- Node.js: 26.3.0
+- npm: 11.16.0
+- PostgreSQL: local server on port 5432
 
 ## Setup
 
-Run all commands from the project root.
+Run commands from the project root.
 
 Install dependencies:
 
@@ -26,13 +32,13 @@ Install dependencies:
 npm ci
 ```
 
-Create the database using pgAdmin or a PostgreSQL query tool:
+Create the database through pgAdmin or a PostgreSQL query tool:
 
 ```sql
 CREATE DATABASE ecommerce;
 ```
 
-Create a `.env` file beside `package.json`:
+Create `.env` beside `package.json`:
 
 ```dotenv
 PORT=3000
@@ -50,9 +56,9 @@ Generate a JWT signing secret:
 node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
 
-Copy the output into `JWT_ACCESS_SECRET`.
+Copy the generated value into `JWT_ACCESS_SECRET`. Keep credentials and tokens private.
 
-Build and apply the database migrations:
+Build and apply migrations:
 
 ```powershell
 npm run build
@@ -67,37 +73,60 @@ npm run start:dev
 
 The API runs at `http://localhost:3000` by default. Restart the server after changing `.env`.
 
+## API Documentation
+
+- Swagger UI: `http://localhost:3000/docs`
+- OpenAPI JSON: `http://localhost:3000/docs-json`
+
+Documentation includes request fields, validation limits, response schemas, error statuses, and bearer authentication.
+
+For protected endpoints, click **Authorize** in Swagger and enter the access token without the `Bearer` prefix.
+
 ## Database Migrations
 
-Automatic schema synchronization is disabled. Database changes are managed through TypeORM migrations.
+Automatic schema synchronization is disabled.
 
-The migration tool uses `src/database/data-source.ts`, compiled to `dist/database/data-source.js`.
+Migration configuration:
+
+```text
+src/database/data-source.ts
+```
+
+Compiled configuration used by the migration tool:
+
+```text
+dist/database/data-source.js
+```
+
+Current tables:
+
+- `users`
+- `refresh_sessions`
+- `migrations`
 
 ### Generate a Migration
 
-After creating or updating an entity:
-
-1. Register new entities in `src/database/data-source.ts`.
-2. Register them through `TypeOrmModule.forFeature()` in the relevant NestJS module.
-3. Build and generate the migration:
+After changing entities, register any new entities in the migration data source and the appropriate NestJS feature module.
 
 ```powershell
 npm run build
 node --env-file=.env ./node_modules/typeorm/cli.js migration:generate ./src/database/migrations/DescribeYourChange -d ./dist/database/data-source.js
 ```
 
-Replace `DescribeYourChange` with a descriptive name. Review the generated SQL before applying it.
+Replace `DescribeYourChange` with a descriptive name.
+
+Review generated SQL before applying it. Adding required columns to populated tables may require backfilling existing rows first.
 
 ### Apply Pending Migrations
 
-Build again to compile newly generated migrations:
+Rebuild after generating or editing a migration:
 
 ```powershell
 npm run build
 node --env-file=.env ./node_modules/typeorm/cli.js migration:run -d ./dist/database/data-source.js
 ```
 
-Applied migrations are tracked in the database's `migrations` table.
+TypeORM records applied migrations and skips them on subsequent runs.
 
 ### Show Migration Status
 
@@ -108,26 +137,29 @@ node --env-file=.env ./node_modules/typeorm/cli.js migration:show -d ./dist/data
 
 ### Revert the Latest Migration
 
-Review its `down()` method first: reverting can delete tables and data.
+Review its `down()` method before running. Reverting can delete data.
 
 ```powershell
 npm run build
 node --env-file=.env ./node_modules/typeorm/cli.js migration:revert -d ./dist/database/data-source.js
 ```
 
-### Avoid Stale Compiled Migrations
+### Stale Build Files
 
-If an unapplied migration is deleted or renamed, remove the project's `dist` folder before rebuilding. Old compiled files can otherwise execute alongside their replacements.
+When deleting or renaming an unapplied migration, remove the project's `dist` folder before rebuilding. Otherwise, stale compiled migrations may execute alongside their replacements.
 
-Do not rewrite migrations that have already been applied. Create a new migration for subsequent schema changes.
+Do not rewrite applied migrations. Create a new migration for subsequent changes.
 
 ## Authentication Endpoints
 
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| POST | `/auth/register` | Create a user |
-| POST | `/auth/login` | Verify credentials and issue tokens |
-| GET | `/auth/me` | Return the authenticated user's profile |
+| Method | Endpoint | Authentication | Success |
+|--------|----------|----------------|---------|
+| POST | `/auth/register` | Registration body | 201 |
+| POST | `/auth/login` | Email and password | 200 |
+| GET | `/auth/me` | Bearer access token | 200 |
+| POST | `/auth/refresh` | Refresh token in body | 200 |
+| POST | `/auth/logout` | Refresh token in body | 204 |
+| POST | `/auth/logout-all` | Bearer access token | 204 |
 
 ### Registration
 
@@ -139,6 +171,130 @@ Do not rewrite migrations that have already been applied. Create a new migration
 }
 ```
 
-Expected responses:
+Rules:
 
-- `201 Created
+- Name: 1–100 characters; trimmed and rejected if blank.
+- Email: valid email, maximum 254 characters; normalized to lowercase.
+- Password: 12–128 characters.
+- Unexpected fields are rejected.
+
+Successful registration returns public user details without issuing tokens.
+
+Invalid input returns `400`. A duplicate email returns `409`.
+
+### Login
+
+```json
+{
+  "email": "manish@example.com",
+  "password": "LearningNest123!"
+}
+```
+
+Successful login returns:
+
+- `accessToken`
+- `refreshToken`
+- `refreshTokenExpiresAt`
+- `tokenType`
+- `expiresIn`, in seconds
+- Public `user` details
+
+Incorrect credentials return `401`.
+
+### Protected Requests
+
+```text
+Authorization: Bearer <accessToken>
+```
+
+`GET /auth/me` returns the authenticated user's public profile.
+
+Missing, invalid, or expired access tokens return `401`.
+
+### Refresh
+
+```json
+{
+  "refreshToken": "<latest-refresh-token>"
+}
+```
+
+A successful refresh returns replacement access and refresh tokens.
+
+Clients must:
+
+- Replace the stored refresh token after each successful refresh.
+- Send only one refresh request at a time.
+- Treat `401` as a failed refresh and require login again.
+
+Malformed input returns `400`. Unknown, expired, revoked, or already-used refresh tokens return `401`.
+
+### Logout
+
+```json
+{
+  "refreshToken": "<refresh-token>"
+}
+```
+
+Logout revokes the supplied token's entire session family, including rotated replacements. Other login families remain active.
+
+A correctly formatted unknown or already-revoked token still returns `204`. Successful responses have no body.
+
+### Logout From All Devices
+
+Send `POST /auth/logout-all` with a bearer access token and no request body.
+
+All current refresh sessions for the user are revoked. Success returns `204` with no body.
+
+## Token and Session Behaviour
+
+- Access tokens expire after 15 minutes.
+- Access-token verification checks signature, expiry, issuer, and audience.
+- Refresh sessions expire seven days after login.
+- Rotation preserves the original session expiry.
+- Each login starts a separate session family.
+- Only SHA-256 hashes of refresh tokens are stored in PostgreSQL.
+- Passwords are hashed with Argon2id.
+- Logout does not immediately invalidate existing access tokens; they remain usable until expiry.
+- Reusing a revoked refresh token is rejected. Automatic family revocation on suspected token reuse is not yet implemented.
+
+Refresh rotation and logout operations use transactions and a shared user-row lock to coordinate concurrent requests.
+
+## Verification Completed
+
+Manual checks covered:
+
+- Successful registration and duplicate-email rejection.
+- Password validation.
+- Successful login and invalid credentials.
+- Valid, missing, and altered access tokens.
+- Refresh rotation and rejection of old tokens.
+- Simultaneous refresh requests: one succeeds and one is rejected.
+- Logout and repeated logout.
+- Logout from all devices.
+- Concurrent refresh and logout-all, with no active sessions remaining.
+- Session-family logout without revoking another login family.
+- Swagger request/response documentation and protected profile access.
+
+## Development Checks
+
+```powershell
+npm run build
+npm run lint
+npm test
+```
+
+Automated authentication integration tests are still pending. Generated starter tests may need updates for the implemented routes and dependencies.
+
+## Next Steps
+
+- Browser login, refresh, and logout using HttpOnly refresh cookies.
+- Trusted browser origins and CSRF protection.
+- Updated OpenAPI documentation for browser and native flows.
+- Refresh-token reuse detection.
+- Authentication rate limiting.
+- Automated integration tests.
+- Email verification and password reset, subject to scope.
+- Angular and Ionic integration after backend completion.

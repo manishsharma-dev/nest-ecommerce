@@ -22,6 +22,10 @@ export class RefreshSession {
     @JoinColumn({ name: 'userId' })
     user!: User;
 
+    @Index()
+    @Column({ type: 'uuid' })
+    familyId!: string;
+
     @Column({ type: 'varchar', length: 64, unique: true, select: false })
     tokenHash!: string;
 
